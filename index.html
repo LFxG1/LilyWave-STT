@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <!-- Only first-party scripts and the Azure Speech SDK are allowed to run
+         (aka.ms redirects to csspeechstorage; blob:/wasm cover the SDK's audio
+         worker). Inline scripts and eval stay blocked to limit XSS. -->
+    <meta http-equiv="Content-Security-Policy"
+        content="script-src 'self' https://aka.ms https://csspeechstorage.blob.core.windows.net blob: 'wasm-unsafe-eval'" />
+    <title>LilyWave &mdash; Transcribe Speech to Text with Azure AI</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <!-- ============================ NAV ============================ -->
+    <header class="nav">
+        <a class="brand" href="#home" aria-label="LilyWave home">
+            <span class="brand__mark">
+                <img src="assets/logo.png" alt="LilyWave logo" />
+            </span>
+            <span class="brand__text">
+                <span class="brand__name">LilyWave</span>
+                <span class="brand__tag">Let your words ripple into text.</span>
+            </span>
+        </a>
+
+        <nav class="nav__links" aria-label="Primary">
+            <a href="#home" class="nav__link is-active">Home</a>
+        </nav>
+
+        <a href="app.html" class="nav__settings">
+            Open App
+            <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <path d="M5 12h14" /><path d="m13 6 6 6-6 6" />
+            </svg>
+        </a>
+    </header>
+
+    <!-- ============================ HERO ============================ -->
+    <main>
+        <section class="hero" id="home">
+            <div class="hero__copy">
+                <h1 class="hero__title">
+                    Transcribe Speech to Text with <span class="hero__accent">Azure AI</span>
+                </h1>
+                <p class="hero__sub">
+                    Real-time microphone transcription or upload audio files and get accurate
+                    transcripts. All powered by Microsoft Azure Speech SDK.
+                </p>
+            </div>
+        </section>
+
+        <!-- ============================ APP PREVIEW ============================ -->
+        <a href="app.html" class="demo-preview-link" id="how" aria-label="Open the LilyWave transcription app">
+            <img src="assets/app-preview.png" alt="LilyWave live transcription app preview" class="demo-preview" />
+            <span class="demo-preview__badge">Open the live app</span>
+        </a>
+    </main>
+</body>
+</html>
