@@ -9,6 +9,7 @@
     <meta http-equiv="Content-Security-Policy"
         content="script-src 'self' https://aka.ms https://csspeechstorage.blob.core.windows.net blob: 'wasm-unsafe-eval'; worker-src 'self' blob: data:" />
     <title>LilyWave &mdash; Live Transcription App</title>
+    <link rel="icon" type="image/png" href="assets/logo.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
     <link href="https://fonts.googleapis.com/css2?family=Spectral:wght@400;500;600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
@@ -85,7 +86,7 @@
                         <span id="azureStatusText">Not connected</span>
                     </span>
                     <span class="status-line status-line--muted">
-                        Stored in browser
+                        Clears on exit
                         <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                             <rect x="3" y="11" width="18" height="11" rx="2" /><path d="M7 11V7a5 5 0 0 1 10 0v4" />
                         </svg>
@@ -144,8 +145,8 @@
                         <h2 class="center-title">Azure Settings</h2>
                     </div>
                     <p class="settings-hint">
-                        Your key and region are stored only in this browser (localStorage) and are
-                        sent directly to Azure. Nothing is uploaded anywhere else.
+                        Your key and region are kept only for this browser tab and are
+                        cleared when the tab session ends. They are sent directly to Azure.
                     </p>
                     <div class="field">
                         <label for="azureKey">Speech resource key</label>
@@ -185,7 +186,7 @@
                         speech automatically as you talk &mdash; removing filler words and fixing
                         grammar in real time. Paste your resource endpoint host; leave
                         <strong>API version</strong> blank for Foundry (<code>services.ai.azure.com</code>)
-                        endpoints. These values are stored only in this browser.
+                        endpoints. These values are kept only for this browser tab.
                     </p>
                     <div class="field">
                         <label for="aoaiEndpoint">Azure OpenAI endpoint</label>
@@ -284,7 +285,7 @@
             <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                 <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" />
             </svg>
-            Your Azure key stays in your browser's localStorage and is sent only to Microsoft Azure to transcribe your audio &mdash; never to any other server.
+            Your Azure key stays in this browser tab, clears when the tab session ends, and is sent only to Microsoft Azure to transcribe your audio &mdash; never to any other server.
         </p>
     </main>
 

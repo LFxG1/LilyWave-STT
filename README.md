@@ -21,7 +21,7 @@ No build step, no backend, no frameworks &mdash; just open the page in a browser
 - **Language selector** &mdash; common recognition languages (defaults to English/US).
 - **Azure Connected status** &mdash; the sidebar shows whether your key/region are set.
 - **Calm watercolor-pond theme** &mdash; airy whites, sage greens, and an Azure-blue accent.
-- **Local-only credentials** &mdash; your Azure key and region live in your browser's `localStorage` and are sent straight to Azure by the SDK.
+- **Session-only credentials** &mdash; your Azure key and region live in this browser tab's `sessionStorage`, clear when the tab session ends, and are sent straight to Azure by the SDK.
 
 ---
 
@@ -85,9 +85,10 @@ Install the **Live Server** extension, right-click `index.html` &rarr; **Open wi
   ```bash
   ffmpeg -i input.mp3 -ar 16000 -ac 1 output.wav
   ```
-- **Security:** the key is stored in `localStorage` for convenience on your own machine.
-  For a shared or public deployment, move the key behind a small backend / token service
-  instead of exposing it in the browser.
+- **Security:** the key is kept in tab-scoped `sessionStorage` instead of persistent
+  `localStorage`, so it clears when the tab session ends. For a shared or public
+  deployment, move the key behind a small backend / token service instead of
+  exposing it in the browser.
 - **Browser support:** use a recent Chrome, Edge, or Firefox. The microphone requires
   `https://` or `http://localhost`.
 
