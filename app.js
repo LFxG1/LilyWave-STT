@@ -7,8 +7,8 @@
    Plus: tabbed sidebar, recording timer, copy / download / clear, and an
    "Azure Connected" status driven by the saved key.
 
-   The Azure key + region live only in localStorage and are sent straight to
-   Azure by the SDK. No custom backend is involved.
+   The Azure key + region live only in tab-scoped sessionStorage and are sent
+   straight to Azure by the SDK. No custom backend is involved.
    ========================================================================= */
 
 (function () {
@@ -16,7 +16,7 @@
 
     // ---- Constants --------------------------------------------------------
     var STORAGE_KEY = "lilywave-settings";
-    var TRANSCRIPTS_KEY = "lilywave-transcripts"; // saved sessions (separate)
+    var TRANSCRIPTS_KEY = "lilywave-transcripts"; // tab-session transcripts
     var SpeechSDK = window.SpeechSDK;
 
     var FILE_WATCHDOG_MS = 120000; // abort stuck file transcription after 2 min
@@ -140,9 +140,64 @@
     // Settings persistence
     // =======================================================================
 
+    function readSessionItem(key) {
+        var raw = null;
+        try {
+            raw = sessionStorage.getItem(key);
+        } catch (err) {
+            console.warn("Could not read browser session storage:", err);
+            return null;
+        }
+
+        try {
+            var legacy = localStorage.getItem(key);
+            if (!raw && legacy) {
+                sessionStorage.setItem(key, legacy);
+                raw = legacy;
+            }
+            if (legacy !== null) {
+                localStorage.removeItem(key);
+            }
+            return raw;
+        } catch (err) {
+            console.warn("Could not clear legacy persistent storage:", err);
+            return raw;
+        }
+    }
+
+    function writeSessionItem(key, value) {
+        try {
+            sessionStorage.setItem(key, value);
+        } catch (err) {
+            console.warn("Could not write browser session storage:", err);
+            return false;
+        }
+
+        try {
+            localStorage.removeItem(key);
+        } catch (err) {
+            console.warn("Could not clear legacy persistent storage:", err);
+        }
+        return true;
+    }
+
+    function removeSessionItem(key) {
+        try {
+            sessionStorage.removeItem(key);
+        } catch (err) {
+            console.warn("Could not clear browser session storage:", err);
+        }
+
+        try {
+            localStorage.removeItem(key);
+        } catch (err) {
+            console.warn("Could not clear legacy persistent storage:", err);
+        }
+    }
+
     function loadSettings() {
         try {
-            var raw = localStorage.getItem(STORAGE_KEY);
+            var raw = readSessionItem(STORAGE_KEY);
             return raw ? JSON.parse(raw) : null;
         } catch (err) {
             console.warn("Could not read saved settings:", err);
@@ -151,14 +206,11 @@
     }
 
     function persistSettings(settings) {
-        try {
-            localStorage.setItem(STORAGE_KEY, JSON.stringify(settings));
+        if (writeSessionItem(STORAGE_KEY, JSON.stringify(settings))) {
             return true;
-        } catch (err) {
-            console.error("Could not save settings:", err);
-            showToast("Unable to save settings in this browser.", "error");
-            return false;
         }
+        showToast("Unable to save settings for this browser tab.", "error");
+        return false;
     }
 
     function getCurrentSettings() {
@@ -470,7 +522,7 @@
                     };
                 })
                 .filter(function (d) { return d.text && d.text.length > 0; });
-            localStorage.setItem(TRANSCRIPTS_KEY, JSON.stringify(data));
+            writeSessionItem(TRANSCRIPTS_KEY, JSON.stringify(data));
         } catch (e) {
             console.warn("Could not save transcripts:", e);
         }
@@ -478,7 +530,7 @@
 
     function loadTranscripts() {
         try {
-            var raw = localStorage.getItem(TRANSCRIPTS_KEY);
+            var raw = readSessionItem(TRANSCRIPTS_KEY);
             if (!raw) {
                 return;
             }
@@ -1515,7 +1567,8 @@
         state.interimText = "";
 
         // Clear only the live/current transcript. Saved session records stay in
-        // state.sessions and localStorage so the Transcript tab keeps history.
+        // state.sessions and sessionStorage so the Transcript tab keeps history
+        // for this browser tab.
         state.segments = state.segments.filter(function (seg) {
             if (seg.sessionId === state.currentSessionId) {
                 removedSegmentIds.push(seg.id);
@@ -1595,12 +1648,13 @@
         });
 
         els.clearSettings.addEventListener("click", function () {
-            localStorage.removeItem(STORAGE_KEY);
+            removeSessionItem(STORAGE_KEY);
             els.azureKey.value = "";
             els.azureRegion.value = "";
             els.aoaiEndpoint.value = "";
             els.aoaiKey.value = "";
             els.aoaiDeployment.value = "";
+            els.aoaiApiVersion.value = "";
             refreshAzureStatus();
             showToast("Saved credentials cleared.");
         });
@@ -1693,7 +1747,11 @@
         render();
         renderTranscriptLog();
         sizeCanvas();
-        startIdleAnimation();
+        if (hasValidCredentials()) {
+            startIdleAnimation();
+        } else {
+            activateTab("settings");
+        }
     }
 
     if (document.readyState === "loading") {
