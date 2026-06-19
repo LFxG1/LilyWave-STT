@@ -1,7 +1,6 @@
 # LilyWave &mdash; Transcribe Speech to Text with Azure AI
 
-![Uploading image.png…]()
-
+<img width="1896" height="1012" alt="image" src="https://github.com/user-attachments/assets/25d431e4-1cf4-484b-8fd5-a39c211b59fa" />
 
 A clean, calming watercolor-pond web app that turns speech into text using the
 **Azure Cognitive Services Speech SDK**. It supports live microphone transcription
