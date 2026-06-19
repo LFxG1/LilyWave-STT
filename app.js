@@ -5,10 +5,10 @@
      1. Continuous real-time microphone transcription (with live waveform).
      2. One-shot transcription of an uploaded .wav file.
    Plus: tabbed sidebar, recording timer, copy / download / clear, and an
-   "Azure Connected" status driven by the saved key.
+   connection status driven by the configured token broker.
 
-   The Azure key + region live only in tab-scoped sessionStorage and are sent
-   straight to Azure by the SDK. No custom backend is involved.
+   Azure Speech keys stay server-side in a user-deployed Azure Function. The
+   browser only asks that Function for short-lived Speech authorization tokens.
    ========================================================================= */
 
 (function () {
@@ -21,6 +21,9 @@
 
     var FILE_WATCHDOG_MS = 120000; // abort stuck file transcription after 2 min
     var MAX_FILE_BYTES = 50 * 1024 * 1024; // 50 MB
+    var TOKEN_REFRESH_SKEW_MS = 60000; // refresh 1 min before token expiry
+    var LOCAL_FUNCTION_PORT = "7071";
+    var SAME_ORIGIN_TOKEN_ENDPOINT = "/api/speech-token";
 
     // ---- DOM references ---------------------------------------------------
     var els = {
@@ -51,13 +54,8 @@
         dropzone: document.getElementById("dropzone"),
         fileInput: document.getElementById("fileInput"),
 
-        azureKey: document.getElementById("azureKey"),
-        azureRegion: document.getElementById("azureRegion"),
+        speechTokenEndpoint: document.getElementById("speechTokenEndpoint"),
         languageSelect: document.getElementById("languageSelect"),
-        aoaiEndpoint: document.getElementById("aoaiEndpoint"),
-        aoaiKey: document.getElementById("aoaiKey"),
-        aoaiDeployment: document.getElementById("aoaiDeployment"),
-        aoaiApiVersion: document.getElementById("aoaiApiVersion"),
         cleanupStyle: document.getElementById("cleanupStyle"),
         saveSettings: document.getElementById("saveSettings"),
         clearSettings: document.getElementById("clearSettings"),
@@ -77,13 +75,16 @@
         recognizer: null,
         isRecording: false,
         isFileProcessing: false,
+        isStartingSpeech: false,
         finalText: "",
         interimText: "",
         fileWatchdog: null,
+        speechToken: null,
+        tokenRefreshTimer: null,
         timerStart: 0,
         timerInterval: null,
         // Live auto-polish: each finalized utterance becomes a segment that is
-        // cleaned up asynchronously by Azure OpenAI and swapped in place.
+        // cleaned up asynchronously by the backend broker and swapped in place.
         segments: [],
         segSeq: 0,
         polishQueue: [],
@@ -96,23 +97,6 @@
         currentSessionId: null,
         selectedSessionId: null, // highlighted entry in the Transcript list
     };
-
-    var DEFAULT_API_VERSION = "2024-10-21";
-    // Tried in order when the configured version is rejected ("API version not
-    // supported") — covers classic Azure OpenAI and newer Foundry projects.
-    var API_VERSION_CANDIDATES = [
-        "2025-01-01-preview",
-        "2024-12-01-preview",
-        "2025-03-01-preview",
-        "2025-04-01-preview",
-        "2025-02-01-preview",
-        "2024-10-21",
-        "2024-08-01-preview",
-        "2024-06-01",
-        "2024-05-01-preview",
-        "preview",
-    ];
-    var resolvedApiVersion = null; // cached once a version succeeds this session
 
     var toastTimer = null;
 
@@ -139,6 +123,53 @@
     // =======================================================================
     // Settings persistence
     // =======================================================================
+
+    function defaultSpeechTokenEndpoint() {
+        var host = window.location.hostname;
+        if (host === "localhost" || host === "127.0.0.1") {
+            return "http://" + host + ":" + LOCAL_FUNCTION_PORT + "/api/speech-token";
+        }
+        if (host === "::1") {
+            return "http://[::1]:" + LOCAL_FUNCTION_PORT + "/api/speech-token";
+        }
+        return SAME_ORIGIN_TOKEN_ENDPOINT;
+    }
+
+    function resolveSpeechTokenEndpoint(endpointOverride) {
+        return (endpointOverride || "").trim() || defaultSpeechTokenEndpoint();
+    }
+
+    function isLocalEndpointHost(hostname) {
+        return hostname === "localhost" || hostname === "127.0.0.1" || hostname === "::1";
+    }
+
+    function normalizeTokenEndpointOverride(value) {
+        var raw = String(value || "").trim();
+        if (!raw) {
+            return "";
+        }
+
+        var url;
+        try {
+            url = new URL(raw, window.location.origin);
+        } catch (err) {
+            throw new Error("Token endpoint override must be a valid URL.");
+        }
+
+        if (url.protocol === "https:" || (url.protocol === "http:" && isLocalEndpointHost(url.hostname))) {
+            return url.toString();
+        }
+
+        throw new Error("Token endpoint override must use HTTPS, except localhost for local development.");
+    }
+
+    function safeTokenEndpointOverride(value) {
+        try {
+            return normalizeTokenEndpointOverride(value);
+        } catch (err) {
+            return "";
+        }
+    }
 
     function readSessionItem(key) {
         var raw = null;
@@ -198,7 +229,12 @@
     function loadSettings() {
         try {
             var raw = readSessionItem(STORAGE_KEY);
-            return raw ? JSON.parse(raw) : null;
+            if (!raw) {
+                return null;
+            }
+            var settings = sanitizeSettings(JSON.parse(raw));
+            writeSessionItem(STORAGE_KEY, JSON.stringify(settings));
+            return settings;
         } catch (err) {
             console.warn("Could not read saved settings:", err);
             return null;
@@ -206,42 +242,53 @@
     }
 
     function persistSettings(settings) {
-        if (writeSessionItem(STORAGE_KEY, JSON.stringify(settings))) {
+        if (writeSessionItem(STORAGE_KEY, JSON.stringify(sanitizeSettings(settings)))) {
             return true;
         }
         showToast("Unable to save settings for this browser tab.", "error");
         return false;
     }
 
-    function getCurrentSettings() {
+    function sanitizeSettings(settings) {
+        var s = settings && typeof settings === "object" ? settings : {};
+        var endpoint = safeTokenEndpointOverride(
+            s.speechTokenEndpointOverride !== undefined
+                ? s.speechTokenEndpointOverride
+                : s.speechTokenEndpoint || s.tokenEndpoint || ""
+        );
+        if (endpoint === defaultSpeechTokenEndpoint()) {
+            endpoint = "";
+        }
         return {
-            key: els.azureKey.value.trim(),
-            region: els.azureRegion.value.trim(),
+            speechTokenEndpoint: endpoint,
+            language: s.language || "en-US",
+            cleanupStyle: s.cleanupStyle || "off",
+        };
+    }
+
+    function getCurrentSettings() {
+        var endpointOverride = safeTokenEndpointOverride(els.speechTokenEndpoint.value);
+        return {
+            speechTokenEndpoint: resolveSpeechTokenEndpoint(endpointOverride),
+            speechTokenEndpointOverride: endpointOverride,
             language: els.languageSelect.value,
-            aoaiEndpoint: els.aoaiEndpoint.value.trim(),
-            aoaiKey: els.aoaiKey.value.trim(),
-            aoaiDeployment: els.aoaiDeployment.value.trim(),
-            // Blank is meaningful: it signals the versionless v1 API.
-            aoaiApiVersion: els.aoaiApiVersion.value.trim(),
             cleanupStyle: els.cleanupStyle.value,
         };
     }
 
     function hasValidCredentials() {
         var s = getCurrentSettings();
-        return Boolean(s.key && s.region);
+        return Boolean(s.speechTokenEndpoint);
     }
 
-    // Auto-polish is available only when Azure OpenAI is fully configured and
-    // the cleanup style isn't "off".
+    // Auto-polish is available when the backend broker is configured and the
+    // cleanup style isn't "off".
     function autoPolishEnabled() {
         var s = getCurrentSettings();
         return Boolean(
             s.cleanupStyle &&
             s.cleanupStyle !== "off" &&
-            s.aoaiEndpoint &&
-            s.aoaiKey &&
-            s.aoaiDeployment
+            s.speechTokenEndpoint
         );
     }
 
@@ -250,8 +297,8 @@
             els.azureStatus.classList.remove("status-line--off");
             els.azureStatus.classList.add("status-line--on");
             els.azureStatusText.textContent = autoPolishEnabled()
-                ? "Connected · Auto-polish"
-                : "Azure Connected";
+                ? "Token broker + Auto-polish"
+                : "Token broker configured";
         } else {
             els.azureStatus.classList.remove("status-line--on");
             els.azureStatus.classList.add("status-line--off");
@@ -298,7 +345,7 @@
         }
         if (name === "settings") {
             window.setTimeout(function () {
-                els.azureKey.focus();
+                els.languageSelect.focus();
             }, 60);
         }
 
@@ -324,6 +371,60 @@
         return t ? t.split(/\s+/).length : 0;
     }
 
+    function replaceChildrenSafe(el) {
+        while (el.firstChild) {
+            el.removeChild(el.firstChild);
+        }
+        for (var i = 1; i < arguments.length; i += 1) {
+            el.appendChild(arguments[i]);
+        }
+    }
+
+    function transcriptFolderIcon(size) {
+        var svg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+        svg.setAttribute("viewBox", "0 0 24 24");
+        svg.setAttribute("width", String(size));
+        svg.setAttribute("height", String(size));
+        svg.setAttribute("fill", "none");
+        svg.setAttribute("stroke", "currentColor");
+        svg.setAttribute("stroke-width", "1.5");
+        svg.setAttribute("stroke-linecap", "round");
+        svg.setAttribute("stroke-linejoin", "round");
+        svg.setAttribute("aria-hidden", "true");
+
+        var path = document.createElementNS("http://www.w3.org/2000/svg", "path");
+        path.setAttribute(
+            "d",
+            "M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5V17a2.5 2.5 0 0 1-2.5 2.5h-13A2.5 2.5 0 0 1 3 17Z"
+        );
+        svg.appendChild(path);
+        return svg;
+    }
+
+    function renderTranscriptPlaceholder() {
+        var placeholder = document.createElement("span");
+        placeholder.className = "transcript-placeholder";
+        placeholder.appendChild(transcriptFolderIcon(44));
+        placeholder.appendChild(
+            document.createTextNode("Create or select a project to save transcripts.")
+        );
+        replaceChildrenSafe(els.transcript, placeholder);
+    }
+
+    function renderLivePlaceholder() {
+        var placeholder = document.createElement("span");
+        placeholder.className = "live-text__placeholder";
+        placeholder.textContent = "Press Start Listening and begin speaking...";
+        replaceChildrenSafe(els.liveText, placeholder);
+    }
+
+    function renderEmptyTranscriptLog(log) {
+        var empty = document.createElement("p");
+        empty.className = "transcript-log__empty";
+        empty.textContent = "No transcripts yet - start listening or upload a file.";
+        replaceChildrenSafe(log, empty);
+    }
+
     // Render the committed transcript into both the right panel and the live
     // view (the live view also shows the in-progress interim text + a cursor).
     function render() {
@@ -333,8 +434,7 @@
         if (text) {
             els.transcript.textContent = text;
         } else {
-            els.transcript.innerHTML =
-                '<span class="transcript-placeholder">Your transcript will appear here.</span>';
+            renderTranscriptPlaceholder();
         }
 
         // Live view: committed + interim + cursor (or placeholder when idle).
@@ -355,12 +455,12 @@
                 var hint = document.createElement("span");
                 hint.className = "polishing-hint";
                 hint.textContent = " · polishing…";
+                hint.textContent = " - polishing...";
                 els.liveText.appendChild(hint);
             }
             els.liveText.scrollTop = els.liveText.scrollHeight;
         } else {
-            els.liveText.innerHTML =
-                '<span class="live-text__placeholder">Press <strong>Start Listening</strong> and begin speaking…</span>';
+            renderLivePlaceholder();
         }
 
         var words = countWords(text);
@@ -595,12 +695,11 @@
         entries.reverse(); // newest first
 
         if (!entries.length) {
-            log.innerHTML =
-                '<p class="transcript-log__empty">No transcripts yet — start listening or upload a file.</p>';
+            renderEmptyTranscriptLog(log);
             return;
         }
 
-        log.innerHTML = "";
+        replaceChildrenSafe(log);
         entries.forEach(function (e) {
             var session = e.session;
             var selected = session.id === state.selectedSessionId;
@@ -776,217 +875,77 @@
         render();
     }
 
-    function cleanupSystemPrompt(style) {
-        var base =
-            "You are a real-time transcription editor. You receive raw speech-to-text " +
-            "output of someone speaking that may contain filler words, false starts, " +
-            "stutters, and repetition. Return ONLY the edited text — no quotes, labels, " +
-            "or commentary. IMPORTANT: if the text contains any real words, NEVER return " +
-            "an empty response — only remove the fillers and keep the real content. Return " +
-            "an empty response only if the input is nothing but filler sounds (um, uh, hmm). " +
-            "Never add information that wasn't said.";
-        if (style === "light") {
-            return (
-                base +
-                " Lightly clean it: remove filler words (um, uh, like, you know), false " +
-                "starts and stutters; fix capitalization and punctuation. Keep the " +
-                "speaker's exact wording and meaning otherwise."
-            );
+    function polishEndpointFromSpeechEndpoint(endpoint) {
+        var value = (endpoint || "").trim();
+        if (!value) {
+            return "";
         }
-        if (style === "heavy") {
-            return (
-                base +
-                " Rewrite it into polished, well-structured prose: remove fillers and " +
-                "repetition, fix grammar, and improve clarity and flow. You may restructure " +
-                "sentences, but preserve the original meaning and intent and do not summarize " +
-                "away content."
-            );
-        }
-        // medium (default)
-        return (
-            base +
-            " Clean it into clear, readable text: remove filler words, false starts, and " +
-            "repetition; fix grammar, capitalization, and punctuation; keep the original " +
-            "meaning, tone, and order. Do not summarize."
-        );
-    }
-
-    // Reduce whatever the user pasted (host, or a full Target URI like
-    // ".../openai/v1/responses", or ".../api/projects/<p>") to its scheme+host
-    // origin, and flag the newer Azure AI Foundry endpoint style.
-    function parseAoaiEndpoint(raw) {
-        var ep = (raw || "").trim().replace(/\/+$/, "");
-        var origin = ep;
-        var host = "";
         try {
-            var u = new URL(ep);
-            origin = u.protocol + "//" + u.host;
-            host = u.host;
-        } catch (e) {
-            var m = ep.match(/^https?:\/\/([^\/]+)/i);
-            if (m) {
-                origin = m[0];
-                host = m[1];
+            var url = new URL(value, window.location.origin);
+            url.pathname = url.pathname.replace(/\/speech-token\/?$/i, "/polish-text");
+            if (!/\/polish-text\/?$/i.test(url.pathname)) {
+                url.pathname = "/api/polish-text";
             }
+            return url.toString();
+        } catch (err) {
+            return value.replace(/\/speech-token\/?$/i, "/polish-text");
         }
-        var isV1 = /\.services\.ai\.azure\.com$/i.test(host);
-        return { origin: origin, host: host, isV1: isV1 };
     }
 
-    function classicUrl(origin, deployment, apiVersion) {
-        return (
-            origin +
-            "/openai/deployments/" +
-            encodeURIComponent(deployment) +
-            "/chat/completions?api-version=" +
-            encodeURIComponent(apiVersion)
-        );
-    }
-
-    function extractContent(data) {
-        var msg =
-            data &&
-            data.choices &&
-            data.choices[0] &&
-            data.choices[0].message &&
-            data.choices[0].message.content;
-        return (msg || "").trim();
-    }
-
-    function handleAoaiResponse(res) {
+    function handlePolishResponse(res) {
         if (!res.ok) {
-            return res.text().then(function (b) {
-                throw new Error("Azure OpenAI " + res.status + ": " + b.slice(0, 200));
+            return res.text().then(function (body) {
+                var message = "Auto-polish " + res.status;
+                try {
+                    var parsed = JSON.parse(body);
+                    if (parsed && parsed.error) {
+                        message += ": " + parsed.error;
+                    }
+                } catch (err) {
+                    if (body) {
+                        message += ": " + body.slice(0, 120);
+                    }
+                }
+                throw new Error(message);
             });
         }
-        return res.json().then(extractContent);
+        return res.json().then(function (data) {
+            return (data && data.text ? data.text : "").trim();
+        });
     }
 
-    // Announce a successful connection once per session.
-    var aoaiConnected = false;
-    function noteAoaiConnected(label) {
-        if (aoaiConnected) {
+    var polishConnected = false;
+    function notePolishConnected() {
+        if (polishConnected) {
             return;
         }
-        aoaiConnected = true;
-        showToast("Auto-polish connected" + (label ? " (" + label + ")" : "") + ".", "success");
+        polishConnected = true;
+        showToast("Auto-polish connected.", "success");
         refreshAzureStatus();
     }
 
-    // Remember the working classic api-version and reflect it into the field.
-    function onApiVersionResolved(version) {
-        if (resolvedApiVersion === version) {
-            return;
+    function polishText(rawText) {
+        var s = getCurrentSettings();
+        var url = polishEndpointFromSpeechEndpoint(s.speechTokenEndpoint);
+        if (!url) {
+            return Promise.reject(new Error("Auto-polish broker endpoint is not configured."));
         }
-        resolvedApiVersion = version;
-        if (els.aoaiApiVersion.value.trim() !== version) {
-            els.aoaiApiVersion.value = version;
-            persistSettings(getCurrentSettings());
-        }
-        refreshAzureStatus();
-    }
-
-    function buildMessages(s, rawText) {
-        return [
-            { role: "system", content: cleanupSystemPrompt(s.cleanupStyle) },
-            { role: "user", content: "Raw transcription to clean now:\n" + rawText },
-        ];
-    }
-
-    // New Azure OpenAI v1 API: versionless OpenAI-compatible route, the model
-    // (deployment) goes in the body, and auth is a Bearer token.
-    // e.g. POST https://<resource>.services.ai.azure.com/openai/v1/chat/completions
-    function polishV1(origin, s, messages) {
-        var url = origin + "/openai/v1/chat/completions";
         return fetch(url, {
             method: "POST",
-            headers: {
-                "Content-Type": "application/json",
-                Authorization: "Bearer " + s.aoaiKey,
-                "api-key": s.aoaiKey,
-            },
+            headers: { "Content-Type": "application/json" },
+            cache: "no-store",
             body: JSON.stringify({
-                model: s.aoaiDeployment,
-                messages: messages,
-                temperature: 0.2,
-                max_tokens: 800,
+                text: rawText,
+                style: s.cleanupStyle,
             }),
         })
-            .then(handleAoaiResponse)
+            .then(handlePolishResponse)
             .then(function (content) {
-                noteAoaiConnected("v1 API");
+                notePolishConnected();
                 return content;
             });
     }
 
-    // Classic Azure OpenAI route: /openai/deployments/{dep}/chat/completions
-    // with ?api-version=, api-key header. Auto-tries known versions on a
-    // "version not supported" 400 and caches whichever one works.
-    function polishClassic(origin, s, messages) {
-        var body = JSON.stringify({
-            messages: messages,
-            temperature: 0.2,
-            max_tokens: 800,
-        });
-        var headers = { "Content-Type": "application/json", "api-key": s.aoaiKey };
-
-        var versions = [];
-        function addVersion(v) {
-            if (v && versions.indexOf(v) === -1) {
-                versions.push(v);
-            }
-        }
-        addVersion(resolvedApiVersion);
-        addVersion(s.aoaiApiVersion);
-        API_VERSION_CANDIDATES.forEach(addVersion);
-
-        function attempt(i) {
-            if (i >= versions.length) {
-                return Promise.reject(
-                    new Error("No supported Azure OpenAI API version found.")
-                );
-            }
-            var version = versions[i];
-            return fetch(classicUrl(origin, s.aoaiDeployment, version), {
-                method: "POST",
-                headers: headers,
-                body: body,
-            }).then(function (res) {
-                if (res.status === 400) {
-                    return res.text().then(function (b) {
-                        if (/api[- ]?version/i.test(b)) {
-                            return attempt(i + 1);
-                        }
-                        throw new Error("Azure OpenAI 400: " + b.slice(0, 200));
-                    });
-                }
-                if (!res.ok) {
-                    return res.text().then(function (b) {
-                        throw new Error("Azure OpenAI " + res.status + ": " + b.slice(0, 200));
-                    });
-                }
-                onApiVersionResolved(version);
-                noteAoaiConnected("API version " + version);
-                return res.json().then(extractContent);
-            });
-        }
-        return attempt(0);
-    }
-
-    // Clean up one utterance. Routes to the v1 API for Foundry
-    // (*.services.ai.azure.com) endpoints or when no api-version is set;
-    // otherwise uses the classic versioned route.
-    function polishText(rawText) {
-        var s = getCurrentSettings();
-        var parsed = parseAoaiEndpoint(s.aoaiEndpoint);
-        var messages = buildMessages(s, rawText);
-        var useV1 = parsed.isV1 || !s.aoaiApiVersion;
-        return useV1
-            ? polishV1(parsed.origin, s, messages)
-            : polishClassic(parsed.origin, s, messages);
-    }
-
-    // =======================================================================
     // Recording timer
     // =======================================================================
 
@@ -1220,20 +1179,140 @@
     // Azure Speech SDK wiring
     // =======================================================================
 
+    function clearTokenRefreshTimer() {
+        if (state.tokenRefreshTimer) {
+            clearTimeout(state.tokenRefreshTimer);
+            state.tokenRefreshTimer = null;
+        }
+    }
+
+    function clearSpeechTokenCache() {
+        clearTokenRefreshTimer();
+        state.speechToken = null;
+    }
+
+    function parseTokenPayload(data) {
+        var token = data && (data.token || data.authToken || data.accessToken);
+        var region = data && data.region;
+        var expiresAt = data && data.expiresAt ? Date.parse(data.expiresAt) : 0;
+        var expiresIn = data && Number(data.expiresIn || data.expires_in || 0);
+
+        if (!expiresAt && expiresIn > 0) {
+            expiresAt = Date.now() + expiresIn * 1000;
+        }
+        if (!expiresAt) {
+            expiresAt = Date.now() + 9 * 60 * 1000;
+        }
+        if (!token || !region) {
+            throw new Error("Token endpoint must return JSON with token and region.");
+        }
+        return {
+            token: token,
+            region: region,
+            expiresAt: expiresAt,
+        };
+    }
+
+    function hasFreshSpeechToken() {
+        return Boolean(
+            state.speechToken &&
+            Date.now() + TOKEN_REFRESH_SKEW_MS < state.speechToken.expiresAt
+        );
+    }
+
+    function tokenEndpointError(err) {
+        var message = err && err.message ? err.message : String(err || "");
+        if (/failed to fetch|network/i.test(message)) {
+            return "Could not reach the Speech token endpoint. Check the Function URL and CORS.";
+        }
+        if (/401|403/.test(message)) {
+            return "Speech token endpoint rejected the request. Check Function auth and CORS settings.";
+        }
+        if (/429/.test(message)) {
+            return "Speech token endpoint is rate limited. Wait a moment and try again.";
+        }
+        return "Speech token error: " + message;
+    }
+
+    function scheduleTokenRefresh() {
+        clearTokenRefreshTimer();
+        if (!state.speechToken) {
+            return;
+        }
+        var delay = Math.max(
+            30000,
+            state.speechToken.expiresAt - Date.now() - TOKEN_REFRESH_SKEW_MS
+        );
+        state.tokenRefreshTimer = setTimeout(function () {
+            if (!state.isRecording && !state.isFileProcessing) {
+                state.tokenRefreshTimer = null;
+                return;
+            }
+            fetchSpeechToken(true)
+                .then(function (tokenInfo) {
+                    if (state.recognizer) {
+                        state.recognizer.authorizationToken = tokenInfo.token;
+                    }
+                })
+                .catch(function (err) {
+                    console.warn("Could not refresh Speech token:", err);
+                    showToast(tokenEndpointError(err), "error");
+                });
+        }, delay);
+    }
+
+    function fetchSpeechToken(forceRefresh) {
+        var s = getCurrentSettings();
+        if (!forceRefresh && hasFreshSpeechToken()) {
+            return Promise.resolve(state.speechToken);
+        }
+        return fetch(s.speechTokenEndpoint, {
+            method: "GET",
+            headers: { "Accept": "application/json" },
+            cache: "no-store",
+        })
+            .then(function (res) {
+                if (!res.ok) {
+                    return res.text().then(function (body) {
+                        throw new Error(
+                            "HTTP " + res.status + (body ? ": " + body.slice(0, 120) : "")
+                        );
+                    });
+                }
+                return res.json();
+            })
+            .then(function (data) {
+                state.speechToken = parseTokenPayload(data);
+                scheduleTokenRefresh();
+                return state.speechToken;
+            });
+    }
+
     function buildSpeechConfig() {
         var s = getCurrentSettings();
-        if (!s.key || !s.region) {
-            showToast("Add your Azure key and region in Settings first.", "error");
+        if (!s.speechTokenEndpoint) {
+            showToast("Token broker endpoint is not configured.", "error");
             activateTab("settings");
-            return null;
+            return Promise.resolve(null);
         }
         if (!SpeechSDK) {
             showToast("Speech SDK failed to load. Check your connection.", "error");
-            return null;
+            return Promise.resolve(null);
         }
-        var config = SpeechSDK.SpeechConfig.fromSubscription(s.key, s.region);
-        config.speechRecognitionLanguage = s.language;
-        return config;
+        return fetchSpeechToken(false)
+            .then(function (tokenInfo) {
+                var config = SpeechSDK.SpeechConfig.fromAuthorizationToken(
+                    tokenInfo.token,
+                    tokenInfo.region
+                );
+                config.speechRecognitionLanguage = s.language;
+                return config;
+            })
+            .catch(function (err) {
+                console.warn("Could not get Speech token:", err);
+                showToast(tokenEndpointError(err), "error");
+                return null;
+            });
     }
 
     function attachHandlers(recognizer, onStopped) {
@@ -1279,7 +1358,7 @@
             return "Connection failed. Check your key, region, and network.";
         }
         if (lower.indexOf("403") !== -1 || lower.indexOf("authentication") !== -1) {
-            return "Authentication failed. Verify your Azure key and region.";
+            return "Authentication failed. Verify your token endpoint and Speech resource settings.";
         }
         if (
             lower.indexOf("format") !== -1 ||
@@ -1307,63 +1386,6 @@
     // Real-time microphone transcription
     // =======================================================================
 
-    function startRecording() {
-        if (state.isRecording || state.isFileProcessing) {
-            return;
-        }
-
-        var speechConfig = buildSpeechConfig();
-        if (!speechConfig) {
-            return;
-        }
-
-        var audioConfig;
-        try {
-            audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
-        } catch (err) {
-            console.error("Microphone unavailable:", err);
-            showToast("Could not access the microphone.", "error");
-            return;
-        }
-
-        var recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
-        attachHandlers(recognizer, function () {
-            if (state.isRecording) {
-                finishRecordingUI();
-                safelyCloseRecognizer();
-            }
-        });
-        state.recognizer = recognizer;
-
-        // Enter the recording UI and start the mic visualizer immediately, so the
-        // bars react as soon as permission is granted - independent of Azure's
-        // connection latency. If Azure then fails to start, finishRecordingUI()
-        // tears the mic stream back down (no dangling stream).
-        beginSession("Microphone");
-        state.interimText = "";
-        rebuildFinalText();
-        state.isRecording = true;
-        activateTab("live");
-        els.recordToggle.classList.add("is-recording");
-        els.recordToggleLabel.textContent = "Stop Listening";
-        els.fileInput.disabled = true;
-        setBadge("Listening…", "listening");
-        startTimer();
-        startVisualizer();
-        render();
-
-        recognizer.startContinuousRecognitionAsync(
-            function () {
-                // Connected; the recording UI + visualizer are already running.
-            },
-            function (err) {
-                console.error("Failed to start recognition:", err);
-                showToast(friendlyError(String(err)), "error");
-                finishRecordingUI();
-                safelyCloseRecognizer();
-            }
-        );
-    }
 
     function stopRecording() {
         if (!state.isRecording || !state.recognizer) {
@@ -1384,6 +1406,7 @@
     }
 
     function finishRecordingUI() {
+        state.isStartingSpeech = false;
         state.isRecording = false;
         state.interimText = "";
         endCurrentSession();
@@ -1393,8 +1416,68 @@
         setBadge("Idle", "idle");
         stopTimer();
         stopVisualizer();
+        clearTokenRefreshTimer();
         render();
         saveTranscripts();
+    }
+
+    function startRecording() {
+        if (state.isRecording || state.isFileProcessing || state.isStartingSpeech) {
+            return;
+        }
+
+        state.isStartingSpeech = true;
+        setBadge("Connecting...", "working");
+
+        buildSpeechConfig().then(function (speechConfig) {
+            state.isStartingSpeech = false;
+            if (!speechConfig) {
+                setBadge("Idle", "idle");
+                return;
+            }
+
+            var audioConfig;
+            try {
+                audioConfig = SpeechSDK.AudioConfig.fromDefaultMicrophoneInput();
+            } catch (err) {
+                console.error("Microphone unavailable:", err);
+                showToast("Could not access the microphone.", "error");
+                setBadge("Idle", "idle");
+                return;
+            }
+
+            var recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+            attachHandlers(recognizer, function () {
+                if (state.isRecording) {
+                    finishRecordingUI();
+                    safelyCloseRecognizer();
+                }
+            });
+            state.recognizer = recognizer;
+
+            beginSession("Microphone");
+            state.interimText = "";
+            rebuildFinalText();
+            state.isRecording = true;
+            activateTab("live");
+            els.recordToggle.classList.add("is-recording");
+            els.recordToggleLabel.textContent = "Stop Listening";
+            els.fileInput.disabled = true;
+            setBadge("Listening...", "listening");
+            startTimer();
+            startVisualizer();
+            render();
+
+            recognizer.startContinuousRecognitionAsync(
+                function () {},
+                function (err) {
+                    console.error("Failed to start recognition:", err);
+                    showToast(friendlyError(String(err)), "error");
+                    finishRecordingUI();
+                    safelyCloseRecognizer();
+                }
+            );
+        });
     }
 
     function toggleRecording() {
@@ -1409,8 +1492,33 @@
     // File transcription (.wav)
     // =======================================================================
 
+
+    function finishFileUI(failed) {
+        if (state.fileWatchdog) {
+            clearTimeout(state.fileWatchdog);
+            state.fileWatchdog = null;
+        }
+        if (!state.isFileProcessing) {
+            return;
+        }
+        state.isFileProcessing = false;
+        state.interimText = "";
+        endCurrentSession();
+        els.recordToggle.disabled = false;
+        setBadge("Idle", "idle");
+        safelyCloseRecognizer();
+        clearTokenRefreshTimer();
+        els.fileInput.value = "";
+        render();
+        saveTranscripts();
+
+        if (!failed) {
+            showToast("File transcription complete.", "success");
+        }
+    }
+
     function transcribeFile(file) {
-        if (state.isRecording || state.isFileProcessing || !file) {
+        if (state.isRecording || state.isFileProcessing || state.isStartingSpeech || !file) {
             return;
         }
 
@@ -1429,72 +1537,56 @@
             return;
         }
 
-        var speechConfig = buildSpeechConfig();
-        if (!speechConfig) {
-            return;
-        }
+        state.isStartingSpeech = true;
+        setBadge("Connecting...", "working");
 
-        var audioConfig;
-        try {
-            audioConfig = SpeechSDK.AudioConfig.fromWavFileInput(file);
-        } catch (err) {
-            console.error("Could not read audio file:", err);
-            showToast("Could not read that audio file.", "error");
-            return;
-        }
-
-        var recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
-        state.recognizer = recognizer;
-        state.isFileProcessing = true;
-        beginSession(file.name);
-        state.interimText = "";
-        rebuildFinalText();
-
-        activateTab("live");
-        els.recordToggle.disabled = true;
-        setBadge("Transcribing…", "working");
-
-        state.fileWatchdog = setTimeout(function () {
-            console.warn("File transcription watchdog fired.");
-            showToast("Transcription timed out. The file may be too long or not PCM WAV.", "error");
-            finishFileUI(true);
-        }, FILE_WATCHDOG_MS);
-
-        attachHandlers(recognizer, function () {
-            finishFileUI(false);
-        });
-
-        recognizer.startContinuousRecognitionAsync(
-            function () {},
-            function (err) {
-                console.error("Failed to transcribe file:", err);
-                showToast(friendlyError(String(err)), "error");
-                finishFileUI(true);
+        buildSpeechConfig().then(function (speechConfig) {
+            state.isStartingSpeech = false;
+            if (!speechConfig) {
+                setBadge("Idle", "idle");
+                return;
             }
-        );
-    }
 
-    function finishFileUI(failed) {
-        if (state.fileWatchdog) {
-            clearTimeout(state.fileWatchdog);
-            state.fileWatchdog = null;
-        }
-        if (!state.isFileProcessing) {
-            return;
-        }
-        state.isFileProcessing = false;
-        state.interimText = "";
-        endCurrentSession();
-        els.recordToggle.disabled = false;
-        setBadge("Idle", "idle");
-        safelyCloseRecognizer();
-        els.fileInput.value = "";
-        render();
-        saveTranscripts();
+            var audioConfig;
+            try {
+                audioConfig = SpeechSDK.AudioConfig.fromWavFileInput(file);
+            } catch (err) {
+                console.error("Could not read audio file:", err);
+                showToast("Could not read that audio file.", "error");
+                setBadge("Idle", "idle");
+                return;
+            }
 
-        if (!failed) {
-            showToast("File transcription complete.", "success");
-        }
+            var recognizer = new SpeechSDK.SpeechRecognizer(speechConfig, audioConfig);
+            state.recognizer = recognizer;
+            state.isFileProcessing = true;
+            beginSession(file.name);
+            state.interimText = "";
+            rebuildFinalText();
+
+            activateTab("live");
+            els.recordToggle.disabled = true;
+            setBadge("Transcribing...", "working");
+
+            state.fileWatchdog = setTimeout(function () {
+                console.warn("File transcription watchdog fired.");
+                showToast("Transcription timed out. The file may be too long or not PCM WAV.", "error");
+                finishFileUI(true);
+            }, FILE_WATCHDOG_MS);
+
+            attachHandlers(recognizer, function () {
+                finishFileUI(false);
+            });
+
+            recognizer.startContinuousRecognitionAsync(
+                function () {},
+                function (err) {
+                    console.error("Failed to transcribe file:", err);
+                    showToast(friendlyError(String(err)), "error");
+                    finishFileUI(true);
+                }
+            );
+        });
     }
 
     // =======================================================================
@@ -1592,16 +1684,9 @@
     function hydrateSettings() {
         var saved = loadSettings();
         if (saved) {
-            els.azureKey.value = saved.key || "";
-            els.azureRegion.value = saved.region || "";
+            els.speechTokenEndpoint.value = saved.speechTokenEndpoint || "";
             if (saved.language) {
                 els.languageSelect.value = saved.language;
-            }
-            els.aoaiEndpoint.value = saved.aoaiEndpoint || "";
-            els.aoaiKey.value = saved.aoaiKey || "";
-            els.aoaiDeployment.value = saved.aoaiDeployment || "";
-            if (saved.aoaiApiVersion) {
-                els.aoaiApiVersion.value = saved.aoaiApiVersion;
             }
             if (saved.cleanupStyle) {
                 els.cleanupStyle.value = saved.cleanupStyle;
@@ -1617,53 +1702,42 @@
             });
         });
 
+        Array.prototype.slice.call(document.querySelectorAll("[data-open-tab]")).forEach(function (button) {
+            button.addEventListener("click", function () {
+                activateTab(button.getAttribute("data-open-tab"));
+            });
+        });
+
         els.navSettingsBtn.addEventListener("click", function () {
             activateTab("settings");
             els.views.settings.scrollIntoView({ behavior: "smooth", block: "center" });
         });
 
         els.saveSettings.addEventListener("click", function () {
-            var s = getCurrentSettings();
-            if (!s.key || !s.region) {
-                showToast("Both key and region are required.", "error");
+            try {
+                normalizeTokenEndpointOverride(els.speechTokenEndpoint.value);
+            } catch (err) {
+                showToast(err.message, "error");
+                els.speechTokenEndpoint.focus();
                 return;
             }
+            var s = getCurrentSettings();
             if (persistSettings(s)) {
                 refreshAzureStatus();
-                // If the user chose a cleanup style but didn't fully configure
-                // Azure OpenAI, let them know auto-polish won't run yet.
-                if (
-                    s.cleanupStyle !== "off" &&
-                    !(s.aoaiEndpoint && s.aoaiKey && s.aoaiDeployment)
-                ) {
-                    showToast(
-                        "Saved. Add the Azure OpenAI endpoint, key, and deployment to enable auto-polish.",
-                        "success"
-                    );
-                } else {
-                    showToast("Settings saved.", "success");
-                }
+                showToast("Settings saved.", "success");
                 activateTab("live");
             }
         });
 
         els.clearSettings.addEventListener("click", function () {
             removeSessionItem(STORAGE_KEY);
-            els.azureKey.value = "";
-            els.azureRegion.value = "";
-            els.aoaiEndpoint.value = "";
-            els.aoaiKey.value = "";
-            els.aoaiDeployment.value = "";
-            els.aoaiApiVersion.value = "";
+            clearSpeechTokenCache();
+            els.speechTokenEndpoint.value = "";
             refreshAzureStatus();
-            showToast("Saved credentials cleared.");
+            showToast("Saved settings cleared.");
         });
 
-        els.azureKey.addEventListener("input", refreshAzureStatus);
-        els.azureRegion.addEventListener("input", refreshAzureStatus);
-        els.aoaiEndpoint.addEventListener("input", refreshAzureStatus);
-        els.aoaiKey.addEventListener("input", refreshAzureStatus);
-        els.aoaiDeployment.addEventListener("input", refreshAzureStatus);
+        els.speechTokenEndpoint.addEventListener("input", refreshAzureStatus);
         els.cleanupStyle.addEventListener("change", refreshAzureStatus);
 
         els.recordToggle.addEventListener("click", toggleRecording);
