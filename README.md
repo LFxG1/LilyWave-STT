@@ -7,7 +7,8 @@ A clean, calming watercolor-pond web app that turns speech into text using the
 with a real-time waveform, `.wav` file transcription, copy-to-clipboard, and
 download-as-text.
 
-No build step, no backend, no frameworks &mdash; just open the page in a browser.
+No frontend build step and no frameworks. For secure Speech auth, run or deploy
+the included Azure Function token broker.
 
 ---
 
@@ -19,9 +20,9 @@ No build step, no backend, no frameworks &mdash; just open the page in a browser
 - **Download** the transcript as a timestamped `.txt` file.
 - **Tabbed demo card** &mdash; Live Transcribe, Upload Audio, Transcript, and Settings.
 - **Language selector** &mdash; common recognition languages (defaults to English/US).
-- **Azure Connected status** &mdash; the sidebar shows whether your key/region are set.
+- **Token broker status** &mdash; the sidebar shows whether the Speech token broker is configured.
 - **Calm watercolor-pond theme** &mdash; airy whites, sage greens, and an Azure-blue accent.
-- **Session-only credentials** &mdash; your Azure key and region live in this browser tab's `sessionStorage`, clear when the tab session ends, and are sent straight to Azure by the SDK.
+- **No Azure keys in the browser** &mdash; Speech and Azure OpenAI keys live in Azure Function app settings; the browser receives only short-lived Speech tokens and polished text.
 
 ---
 
@@ -36,7 +37,58 @@ No build step, no backend, no frameworks &mdash; just open the page in a browser
 
 ---
 
-## 2. Run the app
+## 2. Install or deploy the required token broker
+
+The frontend needs an Azure Function endpoint that returns short-lived Speech
+authorization tokens. See [`functions/README.md`](functions/README.md) for the
+deployable template.
+
+For local testing, install and prepare the broker:
+
+```bash
+cd "C:\Users\feldi\Desktop\Speech to Text App\functions"
+npm install
+npm run setup
+```
+
+`npm install` installs the broker dependencies and repo-local Azure Functions
+Core Tools. `npm run setup` copies the GitHub-safe
+`functions/local.settings.example.json` to ignored `functions/local.settings.json`.
+Then edit `functions/local.settings.json` and set your local `SPEECH_KEY`,
+`SPEECH_REGION`, and optional Azure OpenAI settings for live cleanup. The real
+settings file should not be committed.
+
+`local.settings.json` starts with `IsEncrypted: false` so it is easy to edit.
+After adding local secrets, you can encrypt it with Azure Functions Core Tools;
+see [`functions/README.md`](functions/README.md#security-notes).
+
+At minimum, your Function app settings need:
+
+- `SPEECH_KEY`: your Azure Speech resource key.
+- `SPEECH_REGION`: your Speech resource region, such as `eastus`.
+- `AZURE_OPENAI_ENDPOINT`: optional Azure OpenAI or Foundry endpoint.
+- `AZURE_OPENAI_KEY`: optional Azure OpenAI key.
+- `AZURE_OPENAI_DEPLOYMENT`: optional deployment/model name for live cleanup.
+- `AZURE_OPENAI_API_VERSION`: optional classic Azure OpenAI API version. Classic
+  `*.openai.azure.com` resources can leave this blank to use the built-in
+  fallback list. Leave it blank for Foundry/v1 endpoints.
+- `ALLOWED_ORIGINS`: the web app origins allowed to call the function, such as
+  `http://localhost:5500,https://YOUR-SITE.example.com`.
+- `ALLOW_REQUESTS_WITHOUT_ORIGIN`: keep `false` for normal local/download use.
+  Only set it to `true` behind same-origin hosting, Azure auth, or another
+  trusted gateway.
+
+For local testing, use either `http://localhost:5500/app` or
+`http://127.0.0.1:5500/app` consistently. Browser microphone permissions are
+per origin, so switching between those two can produce different permission
+behavior even though both point to your machine.
+
+For production, deploy the Function and store `SPEECH_KEY` and
+`AZURE_OPENAI_KEY` as Key Vault references rather than as plain app settings.
+
+---
+
+## 3. Run the app
 
 Because the app uses the microphone, browsers require a **secure context**.
 `http://localhost` counts as secure, so a tiny local server is the easiest path.
@@ -49,6 +101,13 @@ npx serve -l 5500 .
 ```
 
 Then open the URL it prints (e.g. <http://localhost:5500>).
+
+In another terminal, start the required local token broker:
+
+```bash
+cd "C:\Users\feldi\Desktop\Speech to Text App\functions"
+npm start
+```
 
 ### Option B &mdash; Python
 
@@ -68,9 +127,9 @@ Install the **Live Server** extension, right-click `index.html` &rarr; **Open wi
 
 ---
 
-## 3. Use it
+## 4. Use it
 
-1. Open the **Settings** tab (or the top-right **Settings** button), paste your **key** + **region**, pick a language, then **Save settings**. The sidebar should switch to **Azure Connected**.
+1. Open the **Settings** tab (or the top-right **Settings** button), pick a language, then **Save settings**. The app uses `http://127.0.0.1:7071/api/speech-token` automatically for local development. Use **Advanced token broker** only if you need to override that endpoint.
 2. On the **Live Transcribe** tab, click **Start Listening** and allow microphone access &mdash; speak and watch the transcript and waveform.
 3. Click **Stop Listening** when done.
 4. Or use **Upload Audio** / **Choose File** to transcribe a `.wav` file.
@@ -85,10 +144,13 @@ Install the **Live Server** extension, right-click `index.html` &rarr; **Open wi
   ```bash
   ffmpeg -i input.mp3 -ar 16000 -ac 1 output.wav
   ```
-- **Security:** the key is kept in tab-scoped `sessionStorage` instead of persistent
-  `localStorage`, so it clears when the tab session ends. For a shared or public
-  deployment, move the key behind a small backend / token service instead of
-  exposing it in the browser.
+- **Security:** Azure keys should stay in Azure Function app settings, ideally as
+  Key Vault references. The browser should only receive short-lived Speech
+  tokens and polished text from the broker.
+- **Deployment model:** this repo is intended for each user to run their own
+  local or self-deployed broker with their own Azure keys. Do not run one shared
+  public broker for untrusted users unless you add real authentication and
+  gateway-level abuse controls.
 - **Browser support:** use a recent Chrome, Edge, or Firefox. The microphone requires
   `https://` or `http://localhost`.
 
@@ -105,6 +167,8 @@ Speech to Text App/
 │   └── pond-bg.png   # Watercolor pond background
 └── README.md         # This file
 ```
+
+The `functions/` folder contains the Azure Function token broker template.
 
 The Azure Speech SDK is loaded from Microsoft's CDN in `index.html`:
 `https://aka.ms/csspeech/jsbrowserpackageraw`

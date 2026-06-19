@@ -7,7 +7,7 @@
          (aka.ms redirects to csspeechstorage; blob:/wasm cover the SDK's audio
          worker). Inline scripts and eval stay blocked to limit XSS. -->
     <meta http-equiv="Content-Security-Policy"
-        content="script-src 'self' https://aka.ms https://csspeechstorage.blob.core.windows.net blob: 'wasm-unsafe-eval'" />
+        content="default-src 'self'; script-src 'self' https://aka.ms https://csspeechstorage.blob.core.windows.net blob: 'wasm-unsafe-eval'; connect-src 'self' http://localhost:7071 http://127.0.0.1:7071 https: wss:; img-src 'self' data: blob:; style-src 'self' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; object-src 'none'; base-uri 'self'; form-action 'none'" />
     <title>LilyWave &mdash; Transcribe Speech to Text with Azure AI</title>
     <link rel="icon" type="image/png" href="assets/logo.png" />
     <link rel="preconnect" href="https://fonts.googleapis.com" />

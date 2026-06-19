@@ -1,5 +1,10 @@
 # Code Review — Stellar Speech (Speech to Text App)
 
+> Superseded note, 2026-06-19: this review describes the older browser-key
+> version of the app. Current security guidance lives in
+> `security_best_practices_report.md`; the current app uses the Azure Function
+> broker template instead of storing Azure keys in the browser.
+
 > Reviewer notes for the build agent. This is a **security + operational review** of the
 > client-side Azure Speech-to-Text app (`index.html`, `app.js`, `styles.css`).
 > Nothing in the source was modified during review — these are findings + suggested fixes.

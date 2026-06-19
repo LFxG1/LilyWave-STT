@@ -1,0 +1,21 @@
+{
+  "name": "lilywave-speech-token-broker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Azure Function token broker for LilyWave Speech authentication.",
+  "main": "src/functions/speech-token.js",
+  "scripts": {
+    "setup": "node scripts/setup-local.js",
+    "start": "npm run setup && func start",
+    "check": "node --check src/functions/speech-token.js"
+  },
+  "dependencies": {
+    "@azure/functions": "^4.7.0"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "azure-functions-core-tools": "^4.12.0"
+  }
+}
